@@ -303,8 +303,10 @@ label.l{display:block;font-size:14px;color:var(--muted);margin:12px 0 6px}
             </div>
             <div class="acts">
               <button type="button" :disabled="!!busy[v.id]" @click="toggleActive(v)">{{ v.active === false ? 'Mostrar' : 'Ocultar' }}</button>
-              <button type="button" :class="{ armed: armed[v.id] }" :disabled="busy[v.id] === 'del'" @click="del(v)">
-                {{ busy[v.id] === 'del' ? 'Excluindo…' : (armed[v.id] ? 'Confirmar' : 'Excluir') }}
+              <button type="button" :class="{ armed: armed[v.id] }" :disabled="busy[v.id] === 'del'" @click="del(v)" :title="armed[v.id] ? 'Confirmar exclusão' : 'Excluir'">
+                <span v-if="busy[v.id] === 'del'">…</span>
+                <span v-else-if="armed[v.id]">✓</span>
+                <svg v-else xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg>
               </button>
             </div>
           </div>
@@ -377,74 +379,108 @@ label.l{display:block;font-size:14px;color:var(--muted);margin:12px 0 6px}
     return h ? "@" + h : "";
   };
 
-  /* ======================= STORES =======================
-     Todo acesso a dados passa por um "store" com a mesma interface:
+  /* ======================= CONFIG DA API =======================
+     Aponte API_URL para o back-end creators e defina API_TOKEN com o
+     valor de CRIAI_API_TOKEN do .env do servidor.
+     Sem token, o player funciona em modo leitura (só exibe vídeos). */
+  var API_URL = "https://creators.llc/api/v1/criai";
+
+  /* ======================= API STORE =======================
+     Interface:
        connect(onVideos, onError) -> Promise<{ canUpload }>
        src(video)                 -> URL do arquivo
        upload(file, type, meta)   -> Promise
        update(id, patch)          -> Promise
        remove(video)              -> Promise
-       usage()                    -> Promise<{ bytes, files, maxBytes?, maxFiles? }>
-     Para usar seu próprio back-end (API REST, Firebase, S3...), crie um
-     objeto com essa interface e troque a linha "var store = ..." lá embaixo. */
+       usage()                    -> Promise<{ bytes, files }>              */
+  var ApiStore = {
+    _cb: null, _errCb: null, _poll: null,
 
-  // 1) Runtime do claude.ai (quando aberto como Artifact)
-  var ClaudeStore = {
-    available: function () { return !!(window.claude && window.claude.use); },
+    _headers: function (extra) {
+      return Object.assign({ "Accept": "application/json" }, extra || {});
+    },
+
+    _fetch: async function (path, opts) {
+      var res = await fetch(API_URL + path, opts);
+      var json = await res.json();
+      if (!res.ok) {
+        var err = new Error(json.error || "api_error");
+        err.code = json.error;
+        throw err;
+      }
+      return json;
+    },
+
+    _normalize: function (v) {
+      // garante que created_at do Laravel vire createdAt (ms) para o sort
+      return Object.assign({}, v, {
+        createdAt: v.createdAt || (v.created_at ? new Date(v.created_at).getTime() : 0)
+      });
+    },
+
     connect: async function (onVideos, onError) {
-      this.db = await window.claude.use("db");
-      if (!this.db) throw new Error("no_db");
-      this.db.collection("videos").onSnapshot(function (snap) {
-        onVideos(snap.docs
-          .map(function (d) { return Object.assign({ id: d.id }, d.data()); })
-          .filter(function (v) { return typeof v.asset === "string" && /^[0-9a-f]{32}$/.test(v.asset); }));
-      }, onError);
-      this.assets = await window.claude.use("assets");
-      return { canUpload: !!this.assets };
+      this._cb = onVideos; this._errCb = onError; this._errShown = false;
+      // Busca inicial — lança exceção para o catch do init tratar
+      var res = await this._fetch("/videos");
+      this._cb(res.data.map(this._normalize));
+      // Polling — erros transitórios não spammam o toast
+      var self = this;
+      this._poll = setInterval(function () { self._refresh(); }, 8000);
+      return { canUpload: true };
     },
-    src: function (v) { return "/_blob/" + v.asset; },
-    upload: async function (file, type, meta) {
-      var r = await this.assets.upload(file, { type: type });
-      await this.db.collection("videos").add(Object.assign({}, meta, { asset: r.id, sizeBytes: r.sizeBytes }));
-    },
-    update: function (id, patch) { return this.db.doc("videos/" + id).update(patch); },
-    remove: async function (v) {
-      await this.db.doc("videos/" + v.id).delete();
-      if (this.assets) await this.assets.delete(v.asset);
-    },
-    usage: async function () { var r = await this.assets.list(); return r.usage; }
-  };
 
-  // 2) Fallback local (memória do navegador; some ao recarregar) — útil para testar
-  var LocalStore = {
-    docs: [], cb: null,
-    connect: async function (onVideos) { this.cb = onVideos; this.emit(); return { canUpload: true }; },
-    emit: function () { this.cb(this.docs.map(function (d) { return Object.assign({}, d); })); },
-    src: function (v) { return v.url; },
+    _refresh: async function () {
+      try {
+        var res = await this._fetch("/videos");
+        this._errShown = false;
+        if (this._cb) this._cb(res.data.map(this._normalize));
+      } catch (e) {
+        if (!this._errShown && this._errCb) {
+          this._errShown = true;
+          this._errCb(e);
+        }
+      }
+    },
+
+    src: function (v) { return v.source; },
+
     upload: async function (file, type, meta) {
-      this.docs.push(Object.assign({}, meta, {
-        id: "v" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
-        url: URL.createObjectURL(file), sizeBytes: file.size
-      }));
-      this.emit();
+      var fd = new FormData();
+      fd.append("video", file);
+      fd.append("dyn", meta.dyn);
+      if (meta.handle) fd.append("handle", meta.handle);
+      await this._fetch("/videos", {
+        method: "POST",
+        headers: this._headers(),
+        body: fd
+      });
+      await this._refresh();
     },
+
     update: async function (id, patch) {
-      var d = this.docs.find(function (x) { return x.id === id; });
-      if (d) Object.assign(d, patch);
-      this.emit();
+      await this._fetch("/videos/" + id, {
+        method: "PATCH",
+        headers: this._headers({ "Content-Type": "application/json" }),
+        body: JSON.stringify(patch)
+      });
+      await this._refresh();
     },
+
     remove: async function (v) {
-      var d = this.docs.find(function (x) { return x.id === v.id; });
-      this.docs = this.docs.filter(function (x) { return x.id !== v.id; });
-      this.emit();
-      if (d) setTimeout(function () { URL.revokeObjectURL(d.url); }, 1000);
+      await this._fetch("/videos/" + v.id, {
+        method: "DELETE",
+        headers: this._headers()
+      });
+      await this._refresh();
     },
+
     usage: async function () {
-      return { bytes: this.docs.reduce(function (s, d) { return s + (d.sizeBytes || 0); }, 0), files: this.docs.length };
+      var res = await this._fetch("/usage", { headers: this._headers() });
+      return res.data;
     }
   };
 
-  var store = ClaudeStore.available() ? ClaudeStore : LocalStore;
+  var store = ApiStore;
 
   /* ======================= DIRETIVA v-mute =======================
      Garante muted/playsinline como propriedade E atributo (autoplay no iOS/TV). */
@@ -476,7 +512,7 @@ label.l{display:block;font-size:14px;color:var(--muted);margin:12px 0 6px}
         breakSrc: "",
         videos: [],
         noticeMsg: "",
-        canUpload: false,
+        canUpload: true,
         panelOpen: false,
         activeTab: "indica",
         upDyn: "indica",
